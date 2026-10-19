@@ -102,6 +102,23 @@ def _validated_base_url(base_url: str) -> Dict[str, Any]:
     return {'scheme': scheme, 'hostname': hostname, 'port': port}
 
 
+class _PinnedRedirectHandler(request.HTTPRedirectHandler):
+    """Re-validate every redirect hop against the allowlisted endpoint.
+
+    ``urlopen`` follows up to ten redirects on its own, so validating only the
+    URL we build would let the configured host bounce the request to an
+    internal address. urllib resolves a relative ``Location`` against the
+    request URL before calling this hook, so ``newurl`` is always absolute.
+    """
+
+    def __init__(self, assert_endpoint) -> None:
+        self._assert_endpoint = assert_endpoint
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        self._assert_endpoint(newurl)
+        return super().redirect_request(req, fp, code, msg, headers, newurl)
+
+
 router = APIRouter()
 
 
@@ -137,14 +154,10 @@ class AgentAnalyticsBackend:
         self._allowed_endpoint = _validated_base_url(base_url)
         self.state_path = state_path or default_state_path()
         self.base_url = base_url.rstrip('/')
+        self._opener = request.build_opener(_PinnedRedirectHandler(self._assert_endpoint))
 
-    def _build_url(self, path: str) -> str:
-        """Join the configured endpoint with a request path and pin scheme/host/port.
-
-        A hostile path fragment (for example one starting with '@' or ':') must not
-        be able to retarget the request away from the configured analytics host.
-        """
-        url = f'{self.base_url}{path}'
+    def _assert_endpoint(self, url: str) -> None:
+        """Reject a URL whose scheme, host or port differs from the configured endpoint."""
         parsed = urlsplit(url)
         try:
             port = parsed.port
@@ -156,7 +169,20 @@ class AgentAnalyticsBackend:
             or port != self._allowed_endpoint['port']
         ):
             raise RuntimeError('Refusing to send a request outside the configured Agent Analytics endpoint')
+
+    def _build_url(self, path: str) -> str:
+        """Join the configured endpoint with a request path and pin scheme/host/port.
+
+        A hostile path fragment (for example one starting with '@' or ':') must not
+        be able to retarget the request away from the configured analytics host.
+        """
+        url = f'{self.base_url}{path}'
+        self._assert_endpoint(url)
         return url
+
+    def _open(self, req, timeout=30):
+        """Send a request through the redirect-guarded opener."""
+        return self._opener.open(req, timeout=timeout)
 
     def load_state(self) -> Dict[str, Any]:
         if not self.state_path.exists():
@@ -186,7 +212,7 @@ class AgentAnalyticsBackend:
             data=json.dumps(body).encode('utf-8') if body is not None else None,
         )
         try:
-            with request.urlopen(req, timeout=30) as response:
+            with self._open(req, timeout=30) as response:
                 return json.loads(response.read().decode('utf-8'))
         except error.HTTPError as exc:
             payload = {}
