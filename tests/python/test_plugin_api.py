@@ -1,10 +1,12 @@
 import asyncio
+import http.server
 import importlib.util
 import json
 import os
 import pathlib
 import re
 import tempfile
+import threading
 import unittest
 from unittest import mock
 
@@ -477,7 +479,7 @@ class OutboundRequestSecurityTests(unittest.TestCase):
             sent.append(req.full_url)
             return _FakeJsonResponse({})
 
-        with mock.patch.object(plugin_api.request, 'urlopen', fake_urlopen):
+        with mock.patch.object(backend, '_open', fake_urlopen):
             for hostile_path in ('@169.254.169.254/latest/meta-data/', '@evil.example/steal', ':443/x'):
                 with self.assertRaises(RuntimeError):
                     backend._request_json('GET', hostile_path)
@@ -492,11 +494,74 @@ class OutboundRequestSecurityTests(unittest.TestCase):
             sent.append(req.full_url)
             return _FakeJsonResponse({'projects': []})
 
-        with mock.patch.object(plugin_api.request, 'urlopen', fake_urlopen):
+        with mock.patch.object(backend, '_open', fake_urlopen):
             data = backend._request_json('GET', '/projects')
 
         self.assertEqual(data, {'projects': []})
         self.assertEqual(sent, ['https://api.agentanalytics.sh/projects'])
+
+    def _serve(self, handler):
+        server = http.server.HTTPServer(('127.0.0.1', 0), handler)
+        threading.Thread(target=server.serve_forever, daemon=True).start()
+        return server
+
+    def test_request_json_rejects_a_redirect_to_an_internal_address(self):
+        """A redirect must not let the allowlisted host bounce the request internally."""
+        hits = []
+
+        class Handler(http.server.BaseHTTPRequestHandler):
+            def do_GET(self):
+                hits.append(self.path)
+                self.send_response(302)
+                self.send_header('Location', 'http://169.254.169.254/latest/meta-data/')
+                self.end_headers()
+
+            def log_message(self, format, *args):
+                pass
+
+        server = self._serve(Handler)
+        try:
+            backend = plugin_api.AgentAnalyticsBackend(base_url=f'http://127.0.0.1:{server.server_port}')
+            with self.assertRaises(RuntimeError):
+                backend._request_json('GET', '/hop')
+        finally:
+            server.shutdown()
+            server.server_close()
+
+        # Only the first hop was sent; the internal target was never contacted.
+        self.assertEqual(hits, ['/hop'])
+
+    def test_request_json_follows_a_redirect_that_stays_on_the_configured_endpoint(self):
+        hits = []
+
+        class Handler(http.server.BaseHTTPRequestHandler):
+            def do_GET(self):
+                hits.append(self.path)
+                if self.path == '/hop':
+                    self.send_response(302)
+                    self.send_header('Location', '/projects')
+                    self.end_headers()
+                    return
+                body = b'{"projects": []}'
+                self.send_response(200)
+                self.send_header('Content-Type', 'application/json')
+                self.send_header('Content-Length', str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+
+            def log_message(self, format, *args):
+                pass
+
+        server = self._serve(Handler)
+        try:
+            backend = plugin_api.AgentAnalyticsBackend(base_url=f'http://127.0.0.1:{server.server_port}')
+            data = backend._request_json('GET', '/hop')
+        finally:
+            server.shutdown()
+            server.server_close()
+
+        self.assertEqual(data, {'projects': []})
+        self.assertEqual(hits, ['/hop', '/projects'])
 
     def test_get_summary_rejects_out_of_range_days_before_sending(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -508,7 +573,7 @@ class OutboundRequestSecurityTests(unittest.TestCase):
                 sent.append(req.full_url)
                 return _FakeJsonResponse({})
 
-            with mock.patch.object(plugin_api.request, 'urlopen', fake_urlopen):
+            with mock.patch.object(backend, '_open', fake_urlopen):
                 for bad_days in (0, -3, 366, 'all', None, True):
                     with self.assertRaises(ValueError):
                         backend.get_summary(days=bad_days)
@@ -528,7 +593,7 @@ class OutboundRequestSecurityTests(unittest.TestCase):
                     return _FakeJsonResponse({'projects': [{'id': 'prj/1 x', 'name': 'docs site'}]})
                 return _FakeJsonResponse({})
 
-            with mock.patch.object(plugin_api.request, 'urlopen', fake_urlopen):
+            with mock.patch.object(backend, '_open', fake_urlopen):
                 summary = backend.get_summary(days=30)
 
             self.assertEqual(summary['days'], 30)
