@@ -3,8 +3,10 @@ import importlib.util
 import json
 import os
 import pathlib
+import re
 import tempfile
 import unittest
+from unittest import mock
 
 MODULE_PATH = pathlib.Path(__file__).resolve().parents[2] / 'dashboard' / 'plugin_api.py'
 spec = importlib.util.spec_from_file_location('plugin_api', MODULE_PATH)
@@ -372,7 +374,8 @@ class AgentAnalyticsBackendTests(unittest.TestCase):
 
             self.assertFalse(status['auth']['connected'])
             self.assertEqual(status['auth']['status'], 'signed_out')
-            self.assertEqual(status['auth']['lastError'], 'Unauthorized')
+            self.assertTrue(status['auth']['lastError'].startswith('Agent Analytics request failed (reference '))
+            self.assertNotIn('Unauthorized', status['auth']['lastError'])
             saved = json.loads(state_path.read_text())
             self.assertIsNone(saved['auth']['accessToken'])
             self.assertEqual(saved['auth']['status'], 'signed_out')
@@ -418,6 +421,154 @@ class AgentAnalyticsBackendTests(unittest.TestCase):
         self.assertIn('Login could not be completed', body)
         self.assertIn('Return to Hermes and start login again', body)
         self.assertNotIn('{"detail"', body)
+
+
+class _FakeJsonResponse:
+    def __init__(self, payload):
+        self._payload = payload
+
+    def read(self):
+        return json.dumps(self._payload).encode('utf-8')
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *args):
+        return False
+
+
+class OutboundRequestSecurityTests(unittest.TestCase):
+    """Regressions for CodeQL py/partial-ssrf and py/stack-trace-exposure."""
+
+    def _connected_state_path(self, tmp):
+        state_path = pathlib.Path(tmp) / 'state.json'
+        state_path.write_text(json.dumps({
+            'auth': {
+                'status': 'connected',
+                'accessToken': 'aas_token',
+                'refreshToken': None,
+                'accountSummary': None,
+                'pendingAuthRequest': None,
+            },
+            'selectedProject': None,
+        }))
+        return state_path
+
+    def test_constructor_rejects_unsafe_base_urls(self):
+        for bad_base_url in (
+            'http://169.254.169.254',
+            'https://169.254.169.254',
+            'https://10.0.0.5',
+            'https://192.168.1.5',
+            'ftp://api.agentanalytics.sh',
+        ):
+            with self.assertRaises(ValueError):
+                plugin_api.AgentAnalyticsBackend(base_url=bad_base_url)
+        # The configured analytics endpoint and local dev servers stay allowed.
+        plugin_api.AgentAnalyticsBackend()
+        plugin_api.AgentAnalyticsBackend(base_url='http://localhost:8080')
+        plugin_api.AgentAnalyticsBackend(base_url='http://127.0.0.1:8080')
+
+    def test_request_json_rejects_paths_that_hijack_the_configured_host(self):
+        backend = plugin_api.AgentAnalyticsBackend()
+        sent = []
+
+        def fake_urlopen(req, timeout=None):
+            sent.append(req.full_url)
+            return _FakeJsonResponse({})
+
+        with mock.patch.object(plugin_api.request, 'urlopen', fake_urlopen):
+            for hostile_path in ('@169.254.169.254/latest/meta-data/', '@evil.example/steal', ':443/x'):
+                with self.assertRaises(RuntimeError):
+                    backend._request_json('GET', hostile_path)
+
+        self.assertEqual(sent, [])
+
+    def test_request_json_sends_legitimate_paths_to_the_configured_endpoint(self):
+        backend = plugin_api.AgentAnalyticsBackend()
+        sent = []
+
+        def fake_urlopen(req, timeout=None):
+            sent.append(req.full_url)
+            return _FakeJsonResponse({'projects': []})
+
+        with mock.patch.object(plugin_api.request, 'urlopen', fake_urlopen):
+            data = backend._request_json('GET', '/projects')
+
+        self.assertEqual(data, {'projects': []})
+        self.assertEqual(sent, ['https://api.agentanalytics.sh/projects'])
+
+    def test_get_summary_rejects_out_of_range_days_before_sending(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            state_path = self._connected_state_path(tmp)
+            backend = plugin_api.AgentAnalyticsBackend(state_path=state_path)
+            sent = []
+
+            def fake_urlopen(req, timeout=None):
+                sent.append(req.full_url)
+                return _FakeJsonResponse({})
+
+            with mock.patch.object(plugin_api.request, 'urlopen', fake_urlopen):
+                for bad_days in (0, -3, 366, 'all', None, True):
+                    with self.assertRaises(ValueError):
+                        backend.get_summary(days=bad_days)
+
+            self.assertEqual(sent, [])
+
+    def test_get_summary_encodes_path_segments_and_query_values(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            state_path = self._connected_state_path(tmp)
+            backend = plugin_api.AgentAnalyticsBackend(state_path=state_path)
+            sent = []
+
+            def fake_urlopen(req, timeout=None):
+                url = req.full_url
+                sent.append(url)
+                if url.endswith('/projects'):
+                    return _FakeJsonResponse({'projects': [{'id': 'prj/1 x', 'name': 'docs site'}]})
+                return _FakeJsonResponse({})
+
+            with mock.patch.object(plugin_api.request, 'urlopen', fake_urlopen):
+                summary = backend.get_summary(days=30)
+
+            self.assertEqual(summary['days'], 30)
+            self.assertIn('https://api.agentanalytics.sh/projects/prj%2F1%20x/usage?days=30', sent)
+            self.assertIn('https://api.agentanalytics.sh/stats?project=docs%20site&days=30', sent)
+            self.assertIn('https://api.agentanalytics.sh/insights?project=docs%20site&period=30d', sent)
+
+    def test_get_status_reports_generic_error_with_correlation_id(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            state_path = pathlib.Path(tmp) / 'state.json'
+            state_path.write_text(json.dumps({
+                'auth': {
+                    'status': 'connected',
+                    'accessToken': 'aas_bad_token',
+                    'refreshToken': None,
+                    'accountSummary': {'email': 'owner@example.com'},
+                    'pendingAuthRequest': None,
+                },
+                'selectedProject': None,
+            }))
+            backend = FakeBackend(
+                state_path=state_path,
+                responses=[RuntimeError('Unauthorized: token aas_bad_token rejected by upstream')],
+            )
+
+            with self.assertLogs(level='ERROR') as captured:
+                status = backend.get_status()
+
+            last_error = status['auth']['lastError']
+            self.assertRegex(last_error, re.compile(r'^Agent Analytics request failed \(reference [0-9a-f]{12}\)$'))
+            self.assertNotIn('Unauthorized', last_error)
+            self.assertNotIn('aas_bad_token', last_error)
+            saved = json.loads(state_path.read_text())
+            self.assertNotIn('Unauthorized', json.dumps(saved))
+            self.assertNotIn('aas_bad_token', json.dumps(saved))
+            # The full trace stays in the server-side log only.
+            server_log = '\n'.join(captured.output)
+            self.assertIn('correlation_id', server_log)
+            self.assertIn('Traceback', server_log)
+            self.assertIn('aas_bad_token', server_log)
 
 
 if __name__ == '__main__':

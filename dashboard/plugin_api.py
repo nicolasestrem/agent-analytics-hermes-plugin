@@ -1,11 +1,15 @@
 from __future__ import annotations
 
 import hashlib
+import ipaddress
 import json
+import logging
 import os
+import secrets
 from pathlib import Path
 from typing import Any, Dict, Optional
 from urllib import error, request
+from urllib.parse import quote, urlencode, urlsplit
 
 try:
     from fastapi import APIRouter, HTTPException
@@ -41,6 +45,63 @@ PLUGIN_STATE_FILE = 'agent-analytics-hermes-plugin.json'
 DEFAULT_BASE_URL = 'https://api.agentanalytics.sh'
 DEFAULT_SCOPES = ['account:read', 'projects:read', 'analytics:read']
 
+MIN_DAYS = 1
+MAX_DAYS = 365
+
+logger = logging.getLogger(__name__)
+
+
+def _coerce_days(value: Any) -> int:
+    """Validate the user-provided reporting window before it reaches a URL."""
+    if isinstance(value, bool):
+        raise ValueError('days must be an integer')
+    try:
+        days = int(value)
+    except (TypeError, ValueError):
+        raise ValueError('days must be an integer')
+    if not MIN_DAYS <= days <= MAX_DAYS:
+        raise ValueError(f'days must be between {MIN_DAYS} and {MAX_DAYS}')
+    return days
+
+
+def _host_is_loopback(hostname: str) -> bool:
+    if hostname in ('localhost', '::1'):
+        return True
+    try:
+        return ipaddress.ip_address(hostname).is_loopback
+    except ValueError:
+        return False
+
+
+def _host_ip_is_global(hostname: str) -> bool:
+    """Domain names are allowed when configured; literal IPs must be public."""
+    try:
+        return ipaddress.ip_address(hostname).is_global
+    except ValueError:
+        return True
+
+
+def _validated_base_url(base_url: str) -> Dict[str, Any]:
+    """Allowlist the outbound endpoint: scheme, host and port are fixed here."""
+    parsed = urlsplit(base_url)
+    scheme = (parsed.scheme or '').lower()
+    hostname = (parsed.hostname or '').lower()
+    try:
+        port = parsed.port
+    except ValueError:
+        raise ValueError('base_url has an invalid port')
+    if scheme not in ('https', 'http'):
+        raise ValueError('base_url must be an http(s) URL')
+    if not hostname:
+        raise ValueError('base_url must include a hostname')
+    loopback = _host_is_loopback(hostname)
+    if not loopback and scheme != 'https':
+        raise ValueError('base_url must use https for non-local endpoints')
+    if not loopback and not _host_ip_is_global(hostname):
+        raise ValueError('base_url must point at a public endpoint')
+    return {'scheme': scheme, 'hostname': hostname, 'port': port}
+
+
 router = APIRouter()
 
 
@@ -73,8 +134,29 @@ def _sha256_hex(value: str) -> str:
 
 class AgentAnalyticsBackend:
     def __init__(self, *, state_path: Optional[Path] = None, base_url: str = DEFAULT_BASE_URL):
+        self._allowed_endpoint = _validated_base_url(base_url)
         self.state_path = state_path or default_state_path()
         self.base_url = base_url.rstrip('/')
+
+    def _build_url(self, path: str) -> str:
+        """Join the configured endpoint with a request path and pin scheme/host/port.
+
+        A hostile path fragment (for example one starting with '@' or ':') must not
+        be able to retarget the request away from the configured analytics host.
+        """
+        url = f'{self.base_url}{path}'
+        parsed = urlsplit(url)
+        try:
+            port = parsed.port
+        except ValueError:
+            port = object()  # never matches the allowlisted port
+        if (
+            (parsed.scheme or '').lower() != self._allowed_endpoint['scheme']
+            or (parsed.hostname or '').lower() != self._allowed_endpoint['hostname']
+            or port != self._allowed_endpoint['port']
+        ):
+            raise RuntimeError('Refusing to send a request outside the configured Agent Analytics endpoint')
+        return url
 
     def load_state(self) -> Dict[str, Any]:
         if not self.state_path.exists():
@@ -98,7 +180,7 @@ class AgentAnalyticsBackend:
         if access_token:
             headers['Authorization'] = f'Bearer {access_token}'
         req = request.Request(
-            f'{self.base_url}{path}',
+            self._build_url(path),
             method=method,
             headers=headers,
             data=json.dumps(body).encode('utf-8') if body is not None else None,
@@ -141,10 +223,15 @@ class AgentAnalyticsBackend:
         if state['auth'].get('accessToken'):
             try:
                 projects = self._list_projects(state)
-            except RuntimeError as exc:
-                last_error = str(exc)
+            except RuntimeError:
+                correlation_id = secrets.token_hex(6)
+                logger.error(
+                    'Agent Analytics project listing failed; signing out (correlation_id=%s)',
+                    correlation_id,
+                    exc_info=True,
+                )
                 state['auth'] = _empty_state()['auth']
-                state['auth']['lastError'] = last_error
+                state['auth']['lastError'] = f'Agent Analytics request failed (reference {correlation_id})'
                 self.save_state(state)
         return self._normalize_status(state, projects)
 
@@ -266,6 +353,7 @@ class AgentAnalyticsBackend:
         return self._normalize_status(state, projects)
 
     def get_summary(self, days: int = 7) -> Dict[str, Any]:
+        days = _coerce_days(days)
         state = self.load_state()
         token = state['auth'].get('accessToken')
         if not token:
@@ -279,12 +367,17 @@ class AgentAnalyticsBackend:
             if not project_id or not project_name:
                 continue
 
-            project = self._request_json('GET', f'/projects/{project_id}', access_token=token)
-            usage = self._request_json('GET', f'/projects/{project_id}/usage?days={days}', access_token=token)
-            stats = self._request_json('GET', f'/stats?project={project_name}&days={days}', access_token=token)
-            pages = self._request_json('GET', f'/pages?project={project_name}&type=entry&days={days}&limit=10', access_token=token)
-            events = self._request_json('GET', f'/events?project={project_name}&days={days}&limit=10', access_token=token)
-            insights = self._request_json('GET', f'/insights?project={project_name}&period={days}d', access_token=token)
+            # Path segments and query values are encoded so request paths cannot
+            # be reshaped by project data or the user-provided day window.
+            encoded_project_id = quote(str(project_id), safe='')
+            encoded_project_name = quote(str(project_name), safe='')
+            encoded_days = urlencode({'days': days})
+            project = self._request_json('GET', f'/projects/{encoded_project_id}', access_token=token)
+            usage = self._request_json('GET', f'/projects/{encoded_project_id}/usage?{encoded_days}', access_token=token)
+            stats = self._request_json('GET', f'/stats?project={encoded_project_name}&{encoded_days}', access_token=token)
+            pages = self._request_json('GET', f'/pages?project={encoded_project_name}&type=entry&{encoded_days}&limit=10', access_token=token)
+            events = self._request_json('GET', f'/events?project={encoded_project_name}&{encoded_days}&limit=10', access_token=token)
+            insights = self._request_json('GET', f'/insights?project={encoded_project_name}&period={days}d', access_token=token)
 
             project_summaries.append({
                 'selectedProject': {
@@ -371,5 +464,7 @@ async def select_project(body: Dict[str, Any]) -> Dict[str, Any]:
 async def summary(days: int = 7) -> Dict[str, Any]:
     try:
         return backend.get_summary(days=days)
+    except ValueError:
+        raise HTTPException(status_code=400, detail='Invalid days parameter')
     except RuntimeError as exc:
         raise HTTPException(status_code=400, detail=str(exc))
