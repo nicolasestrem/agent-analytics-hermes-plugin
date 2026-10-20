@@ -2,6 +2,7 @@ import asyncio
 import http.server
 import importlib.util
 import json
+import logging
 import os
 import pathlib
 import re
@@ -634,6 +635,185 @@ class OutboundRequestSecurityTests(unittest.TestCase):
             self.assertIn('correlation_id', server_log)
             self.assertIn('Traceback', server_log)
             self.assertIn('aas_bad_token', server_log)
+
+
+LEAKED_UPSTREAM_TEXT = (
+    'sqlite3.OperationalError: unable to open /srv/private/aa.sqlite (token=sentinel-value-123)'
+)
+
+
+class _LogCapture:
+    """Collect server-side log output without requiring any record to be emitted."""
+
+    def __enter__(self):
+        self.records = []
+        self._handler = logging.Handler()
+        self._handler.emit = self.records.append
+        self._level = plugin_api.logger.level
+        plugin_api.logger.addHandler(self._handler)
+        plugin_api.logger.setLevel(logging.ERROR)
+        return self
+
+    def __exit__(self, *args):
+        plugin_api.logger.removeHandler(self._handler)
+        plugin_api.logger.setLevel(self._level)
+        return False
+
+    @property
+    def text(self) -> str:
+        formatter = logging.Formatter()
+        return '\n'.join(formatter.format(record) for record in self.records)
+
+
+class _RaisingBackend:
+    """Backend stub whose failures carry text that must never reach the client."""
+
+    def __init__(self, message: str = LEAKED_UPSTREAM_TEXT):
+        self.message = message
+
+    def start_auth(self):
+        raise RuntimeError(self.message)
+
+    def poll_auth(self):
+        raise RuntimeError(self.message)
+
+    def select_project(self, project_id):
+        raise RuntimeError(self.message)
+
+    def get_summary(self, days=7):
+        raise RuntimeError(self.message)
+
+
+class RouteErrorDisclosureTests(unittest.TestCase):
+    """Dashboard error banners must never render exception or upstream text."""
+
+    def _assert_public_failure(self, route, *args):
+        with mock.patch.object(plugin_api, 'backend', _RaisingBackend()):
+            with _LogCapture() as captured:
+                with self.assertRaises(plugin_api.HTTPException) as caught:
+                    asyncio.run(route(*args))
+
+        failure = caught.exception
+        self.assertEqual(failure.status_code, 400)
+        self.assertIsInstance(failure.detail, str)
+        self.assertTrue(failure.detail)
+        self.assertNotIn('sentinel-value-123', failure.detail)
+        self.assertNotIn('/srv/private', failure.detail)
+        self.assertNotIn('sqlite3.OperationalError', failure.detail)
+        self.assertRegex(
+            failure.detail,
+            re.compile(r'^Agent Analytics request failed \(reference [0-9a-f]{12}\)$'),
+        )
+        # The reference in the response must match the server-side log entry.
+        match = re.fullmatch(
+            r'Agent Analytics request failed \(reference ([0-9a-f]{12})\)',
+            failure.detail,
+        )
+        self.assertIsNotNone(match)
+        reference = match.group(1) if match else ''
+        server_log = captured.text
+        self.assertIn(f'correlation_id={reference}', server_log)
+        self.assertIn('Traceback', server_log)
+        self.assertIn('sentinel-value-123', server_log)
+
+    def test_auth_start_failure_does_not_echo_exception_text(self):
+        self._assert_public_failure(plugin_api.start_auth)
+
+    def test_auth_poll_failure_does_not_echo_exception_text(self):
+        self._assert_public_failure(plugin_api.poll_auth)
+
+    def test_project_select_failure_does_not_echo_exception_text(self):
+        self._assert_public_failure(plugin_api.select_project, {'project_id': 'proj_1'})
+
+    def test_summary_failure_does_not_echo_exception_text(self):
+        self._assert_public_failure(plugin_api.summary, 7)
+
+    def test_summary_without_a_session_reports_a_connect_reason(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            backend = plugin_api.AgentAnalyticsBackend(
+                state_path=pathlib.Path(tmp) / 'state.json'
+            )
+            with mock.patch.object(plugin_api, 'backend', backend):
+                with self.assertRaises(plugin_api.HTTPException) as caught:
+                    asyncio.run(plugin_api.summary(7))
+
+        self.assertEqual(caught.exception.status_code, 400)
+        self.assertIn('Connect your Agent Analytics account', caught.exception.detail)
+
+    def test_project_select_unknown_project_reports_a_fixed_reason(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            state_path = pathlib.Path(tmp) / 'state.json'
+            state_path.write_text(json.dumps({
+                'auth': {'status': 'connected', 'accessToken': 'aas_token'},
+                'selectedProject': None,
+            }))
+            backend = FakeBackend(
+                state_path=state_path,
+                responses=[{'projects': [{'id': 'proj_1', 'name': 'docs'}]}],
+            )
+            with mock.patch.object(plugin_api, 'backend', backend):
+                with self.assertRaises(plugin_api.HTTPException) as caught:
+                    asyncio.run(plugin_api.select_project({'project_id': 'proj_missing'}))
+
+        self.assertEqual(caught.exception.status_code, 400)
+        self.assertIn('no longer available', caught.exception.detail)
+        self.assertNotIn('Project not found', caught.exception.detail)
+
+    def test_auth_poll_without_a_pending_request_reports_a_fixed_reason(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            state_path = pathlib.Path(tmp) / 'state.json'
+            state_path.write_text(json.dumps({
+                'auth': {'status': 'signed_out', 'pendingAuthRequest': None},
+                'selectedProject': None,
+            }))
+            backend = FakeBackend(state_path=state_path, responses=[])
+            with mock.patch.object(plugin_api, 'backend', backend):
+                with self.assertRaises(plugin_api.HTTPException) as caught:
+                    asyncio.run(plugin_api.poll_auth())
+
+        self.assertEqual(caught.exception.status_code, 400)
+        self.assertIn('Start login again', caught.exception.detail)
+        self.assertNotIn('No pending auth request', caught.exception.detail)
+
+    def test_upstream_error_body_is_not_echoed_by_the_summary_route(self):
+        class Handler(http.server.BaseHTTPRequestHandler):
+            def do_GET(self):
+                body = json.dumps({'message': LEAKED_UPSTREAM_TEXT}).encode('utf-8')
+                self.send_response(500)
+                self.send_header('Content-Type', 'application/json')
+                self.send_header('Content-Length', str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+
+            def log_message(self, format, *args):
+                pass
+
+        server = http.server.HTTPServer(('127.0.0.1', 0), Handler)
+        threading.Thread(target=server.serve_forever, daemon=True).start()
+        try:
+            with tempfile.TemporaryDirectory() as tmp:
+                state_path = pathlib.Path(tmp) / 'state.json'
+                state_path.write_text(json.dumps({
+                    'auth': {'status': 'connected', 'accessToken': 'aas_token'},
+                    'selectedProject': None,
+                }))
+                backend = plugin_api.AgentAnalyticsBackend(
+                    state_path=state_path,
+                    base_url=f'http://127.0.0.1:{server.server_port}',
+                )
+                with mock.patch.object(plugin_api, 'backend', backend):
+                    with _LogCapture() as captured:
+                        with self.assertRaises(plugin_api.HTTPException) as caught:
+                            asyncio.run(plugin_api.summary(7))
+        finally:
+            server.shutdown()
+            server.server_close()
+
+        self.assertEqual(caught.exception.status_code, 400)
+        self.assertNotIn('sentinel-value-123', caught.exception.detail)
+        self.assertNotIn('/srv/private', caught.exception.detail)
+        self.assertIn('reference', caught.exception.detail)
+        self.assertIn('sentinel-value-123', captured.text)
 
 
 if __name__ == '__main__':
