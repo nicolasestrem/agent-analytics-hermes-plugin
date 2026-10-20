@@ -50,6 +50,43 @@ MAX_DAYS = 365
 
 logger = logging.getLogger(__name__)
 
+GENERIC_FAILURE_REASON = 'Agent Analytics request failed'
+
+
+class AgentAnalyticsError(RuntimeError):
+    """Backend failure that carries a fixed, dashboard-safe reason.
+
+    Only reasons declared here reach the client. Exception text — which can
+    include upstream API messages, local paths or tokens — stays in the server
+    log, keyed by the correlation id returned to the user.
+    """
+
+    public_reason = GENERIC_FAILURE_REASON
+
+
+class ConnectionRequired(AgentAnalyticsError):
+    public_reason = 'Connect your Agent Analytics account to continue.'
+
+
+class ProjectUnavailable(AgentAnalyticsError):
+    public_reason = 'That project is no longer available. Refresh the project list and try again.'
+
+
+class NoPendingAuthRequest(AgentAnalyticsError):
+    public_reason = 'No Agent Analytics login is pending. Start login again.'
+
+
+class StaleAuthRequest(AgentAnalyticsError):
+    public_reason = 'This Agent Analytics approval link is no longer valid. Start login again.'
+
+
+class EndpointRefused(AgentAnalyticsError):
+    public_reason = 'The configured Agent Analytics endpoint refused this request.'
+
+
+class UpstreamRequestFailed(AgentAnalyticsError):
+    """Upstream API text is preserved for the server log only."""
+
 
 def _coerce_days(value: Any) -> int:
     """Validate the user-provided reporting window before it reaches a URL."""
@@ -168,7 +205,7 @@ class AgentAnalyticsBackend:
             or (parsed.hostname or '').lower() != self._allowed_endpoint['hostname']
             or port != self._allowed_endpoint['port']
         ):
-            raise RuntimeError('Refusing to send a request outside the configured Agent Analytics endpoint')
+            raise EndpointRefused('Refusing to send a request outside the configured Agent Analytics endpoint')
 
     def _build_url(self, path: str) -> str:
         """Join the configured endpoint with a request path and pin scheme/host/port.
@@ -220,7 +257,10 @@ class AgentAnalyticsBackend:
                 payload = json.loads(exc.read().decode('utf-8'))
             except Exception:
                 payload = {}
-            raise RuntimeError(payload.get('message') or payload.get('error') or f'HTTP {exc.code}')
+            reason = payload.get('message') or payload.get('error') or f'HTTP {exc.code}'
+            raise UpstreamRequestFailed(
+                f'Agent Analytics API returned HTTP {exc.code}: {reason}'
+            ) from None
 
     def _normalize_status(self, state: Dict[str, Any], projects: Optional[list] = None) -> Dict[str, Any]:
         auth = state['auth']
@@ -306,7 +346,7 @@ class AgentAnalyticsBackend:
         if not pending:
             if state['auth'].get('accessToken'):
                 return self._normalize_status(state, self._list_projects(state))
-            raise RuntimeError('No pending auth request')
+            raise NoPendingAuthRequest('No pending auth request')
         polled = self._request_json('POST', '/agent-sessions/poll', body={
             'auth_request_id': pending['authRequestId'],
             'poll_token': pending['pollToken'],
@@ -353,7 +393,7 @@ class AgentAnalyticsBackend:
         state = self.load_state()
         pending = state['auth'].get('pendingAuthRequest') or {}
         if pending.get('authRequestId') != request_id:
-            raise RuntimeError('Unknown auth request')
+            raise StaleAuthRequest('Unknown auth request')
         result = self._exchange_into_state(state, request_id, exchange_code, pending.get('codeVerifier'))
         self.save_state(state)
         return result
@@ -369,7 +409,7 @@ class AgentAnalyticsBackend:
         projects = self._list_projects(state)
         project = next((item for item in projects if str(item.get('id')) == str(project_id)), None)
         if not project:
-            raise RuntimeError('Project not found')
+            raise ProjectUnavailable('Project not found')
         state['selectedProject'] = {
             'id': project.get('id'),
             'name': project.get('name'),
@@ -383,7 +423,7 @@ class AgentAnalyticsBackend:
         state = self.load_state()
         token = state['auth'].get('accessToken')
         if not token:
-            raise RuntimeError('Not connected')
+            raise ConnectionRequired('Not connected')
 
         projects = self._list_projects(state)
         project_summaries = []
@@ -435,6 +475,26 @@ def _auth_callback_page(*, title: str, message: str, status_code: int = 200, aut
     return HTMLResponse(html, status_code=status_code)
 
 
+def _public_http_error(exc: RuntimeError, *, context: str) -> HTTPException:
+    """Map a backend failure onto a dashboard error without echoing its text.
+
+    Only :class:`AgentAnalyticsError` subclasses may publish their fixed
+    ``public_reason``. Everything else — including arbitrary runtime errors and
+    upstream API messages — becomes the generic reason plus a correlation id
+    that points at the full traceback in the server log.
+    """
+    correlation_id = secrets.token_hex(6)
+    reason = getattr(type(exc), 'public_reason', None)
+    if isinstance(reason, str) and reason != GENERIC_FAILURE_REASON:
+        logger.info('%s refused: %s', context, reason)
+        return HTTPException(status_code=400, detail=reason)
+    logger.error('%s failed (correlation_id=%s)', context, correlation_id, exc_info=True)
+    return HTTPException(
+        status_code=400,
+        detail=f'{GENERIC_FAILURE_REASON} (reference {correlation_id})',
+    )
+
+
 @router.get('/status')
 async def get_status() -> Dict[str, Any]:
     return backend.get_status()
@@ -445,7 +505,7 @@ async def start_auth() -> Dict[str, Any]:
     try:
         return backend.start_auth()
     except RuntimeError as exc:
-        raise HTTPException(status_code=400, detail=str(exc))
+        raise _public_http_error(exc, context='auth start') from None
 
 
 @router.post('/auth/poll')
@@ -453,7 +513,7 @@ async def poll_auth() -> Dict[str, Any]:
     try:
         return backend.poll_auth()
     except RuntimeError as exc:
-        raise HTTPException(status_code=400, detail=str(exc))
+        raise _public_http_error(exc, context='auth poll') from None
 
 
 @router.get('/auth/callback')
@@ -483,7 +543,7 @@ async def select_project(body: Dict[str, Any]) -> Dict[str, Any]:
     try:
         return backend.select_project(str(body.get('project_id') or ''))
     except RuntimeError as exc:
-        raise HTTPException(status_code=400, detail=str(exc))
+        raise _public_http_error(exc, context='project select') from None
 
 
 @router.get('/summary')
@@ -493,4 +553,4 @@ async def summary(days: int = 7) -> Dict[str, Any]:
     except ValueError:
         raise HTTPException(status_code=400, detail='Invalid days parameter')
     except RuntimeError as exc:
-        raise HTTPException(status_code=400, detail=str(exc))
+        raise _public_http_error(exc, context='summary') from None
